@@ -1,7 +1,7 @@
 ﻿/*
  * RealSense Tools
  * A toolkit for working with RealSense depth cameras.
- * Copyright 2020 Tom Svilans
+ * Copyright 2020 CITA
  * 
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,28 +17,20 @@
  * 
  */
 
+using Intel.RealSense;
+using Volvox_Cloud;
+
+using Rhino.Geometry;
+using Grasshopper.Kernel;
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Drawing;
-
 using System.Diagnostics;
-
-using Grasshopper.Kernel;
-using Grasshopper.Kernel.Types;
-using Rhino.Geometry;
-
-using System.Text;
 using System.Threading.Tasks;
-
-using Intel.RealSense;
-using Volvox_Cloud;
 using System.Threading;
-using System.Linq.Expressions;
 using System.Runtime.InteropServices;
-using System.Drawing.Imaging;
-using System.CodeDom.Compiler;
-using System.ServiceModel.Configuration;
 
 namespace RsTools.GH.Components
 {
@@ -174,7 +166,6 @@ namespace RsTools.GH.Components
 
             var pipeline = new Pipeline();
             var pp = pipeline.Start(cfg);
-            //var pp = pipeline.Start();
 
             while (IsOn)
             {
