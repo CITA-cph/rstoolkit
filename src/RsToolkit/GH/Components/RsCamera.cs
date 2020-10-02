@@ -32,6 +32,8 @@ using System.Threading.Tasks;
 using System.Threading;
 using System.Runtime.InteropServices;
 
+using RPointCloud = Rhino.Geometry.PointCloud; // Avoid conflict with Intel.RealSense.PointCloud and Rhino.Geometry.PointCloud
+
 namespace RsTools.GH.Components
 {
     public class Cmpt_RsCamera : GH_Component
@@ -39,16 +41,22 @@ namespace RsTools.GH.Components
         public Cmpt_RsCamera()
           : base("RsCamera", "RsCam",
               "Get data from RealSense depth camera.",
-              "RsTools", "Main")
+              "RsTools", "Sense")
         {
         }
 
-        private Thread _thread = null;
-        private volatile bool IsOn = false;
+        // ======== Thread stuff ========
 
-        private Rhino.Geometry.PointCloud pointcloud = new Rhino.Geometry.PointCloud();
-        private Transform xform = Transform.Identity;
-        private Box clipping_box = Box.Empty;
+        private Thread          m_thread = null;
+        private volatile bool   m_is_on = false;
+
+        // ======== Rhino objects ========
+
+        private RPointCloud     m_pointcloud = new RPointCloud();
+        private Transform       m_xform = Transform.Identity;
+        private Box             m_clipping_box = Box.Empty;
+
+        // ======== RealSense filter variables ========
 
         private int DecimationMagnitude = 2;
 
@@ -79,7 +87,7 @@ namespace RsTools.GH.Components
 
         protected override void RegisterOutputParams(GH_Component.GH_OutputParamManager pManager)
         {
-            pManager.AddGenericParameter("Output", "O", "Generic output stuff.", GH_ParamAccess.item);
+            pManager.AddGenericParameter("Output", "O", "Output pointcloud from RealSense camera.", GH_ParamAccess.item);
         }
 
         public Color[] GetPointColors(VideoFrame vf, Point2f[] tx)
@@ -131,15 +139,6 @@ namespace RsTools.GH.Components
             return colors;
         }
 
-        private Rhino.Geometry.PointCloud CropCloud(Rhino.Geometry.PointCloud cloud, Box clipping_box)
-        {
-            var new_cloud = new Rhino.Geometry.PointCloud();
-            var points = cloud.Where(x => clipping_box.Contains(x.Location));
-            
-            new_cloud.AddRange(points.Select(x => x.Location), points.Select(x => x.Color));
-            return new_cloud;
-        }
-
         private void RunThread()
         {
             Intel.RealSense.PointCloud pc = new Intel.RealSense.PointCloud();
@@ -167,7 +166,7 @@ namespace RsTools.GH.Components
             var pipeline = new Pipeline();
             var pp = pipeline.Start(cfg);
 
-            while (IsOn)
+            while (m_is_on)
             {
                 using (var frames = pipeline.WaitForFrames())
                 {
@@ -226,24 +225,25 @@ namespace RsTools.GH.Components
 
                     // ======== TRANSFORM ======== 
 
-                    if (xform.IsValid)
+                    if (m_xform.IsValid)
                     {
                         Parallel.For(0, vertices.Length - 1, (i) =>
                         {
-                            vertices[i].Transform(xform);
+                            vertices[i].Transform(m_xform);
                         });
                     }
                     
                     // ======== CLIP TO BOX ======== 
-                    if (clipping_box.IsValid &&
-                        clipping_box.X.Length > 0 &&
-                        clipping_box.Y.Length > 0 &&
-                        clipping_box.Z.Length > 0)
+
+                    if (m_clipping_box.IsValid &&
+                        m_clipping_box.X.Length > 0 &&
+                        m_clipping_box.Y.Length > 0 &&
+                        m_clipping_box.Z.Length > 0)
                     {
-                        Point3d box_centre = clipping_box.Plane.Origin;
-                        double minx = clipping_box.X.Min + box_centre.X, maxx = clipping_box.X.Max + box_centre.X;
-                        double miny = clipping_box.Y.Min + box_centre.Y, maxy = clipping_box.Y.Max + box_centre.Y;
-                        double minz = clipping_box.Z.Min + box_centre.Z, maxz = clipping_box.Z.Max + box_centre.Z;
+                        Point3d box_centre = m_clipping_box.Plane.Origin;
+                        double minx = m_clipping_box.X.Min + box_centre.X, maxx = m_clipping_box.X.Max + box_centre.X;
+                        double miny = m_clipping_box.Y.Min + box_centre.Y, maxy = m_clipping_box.Y.Max + box_centre.Y;
+                        double minz = m_clipping_box.Z.Min + box_centre.Z, maxz = m_clipping_box.Z.Max + box_centre.Z;
 
                         var flags = new bool[vertices.Length];
                         int new_size = 0;
@@ -281,11 +281,11 @@ namespace RsTools.GH.Components
                     
                     var point_colors = GetPointColors(color, tex_coords);
 
-                    Rhino.Geometry.PointCloud new_pointcloud = new Rhino.Geometry.PointCloud();
+                    RPointCloud new_pointcloud = new RPointCloud();
                     new_pointcloud.AddRange(vertices.Select(x => new Point3d(x)), point_colors);
 
-                    lock (pointcloud)
-                        pointcloud = new_pointcloud;
+                    lock (m_pointcloud)
+                        m_pointcloud = new_pointcloud;
                 }
             }
 
@@ -352,29 +352,29 @@ namespace RsTools.GH.Components
             //    _thread.Join();
             //}
 
-            DA.GetData("ON", ref IsOn);
-            DA.GetData("Transform", ref xform);
-            DA.GetData("Clipping Box", ref clipping_box);
+            DA.GetData("ON", ref m_is_on);
+            DA.GetData("Transform", ref m_xform);
+            DA.GetData("Clipping Box", ref m_clipping_box);
 
-            if (_thread == null || !_thread.IsAlive)
-                _thread = new Thread(new ThreadStart(RunThread));
+            if (m_thread == null || !m_thread.IsAlive)
+                m_thread = new Thread(new ThreadStart(RunThread));
 
-            if (IsOn && _thread.ThreadState == System.Threading.ThreadState.Unstarted)
+            if (m_is_on && m_thread.ThreadState == System.Threading.ThreadState.Unstarted)
             {
                 bool filters_changed = CheckFiltersChanged(DA);
-                _thread.Start();
+                m_thread.Start();
             }
-            else if (!IsOn)
+            else if (!m_is_on)
             {
-                if (_thread != null && _thread.IsAlive)
-                    _thread.Join();
+                if (m_thread != null && m_thread.IsAlive)
+                    m_thread.Join();
             }
 
-            lock (pointcloud)
-                DA.SetData("Output", new GH_Cloud(pointcloud));
+            lock (m_pointcloud)
+                DA.SetData("Output", new GH_Cloud(m_pointcloud)); // The only point where we use Volvox_Cloud.dll
         }
 
-        protected override System.Drawing.Bitmap Icon
+        protected override Bitmap Icon
         {
             get
             {
