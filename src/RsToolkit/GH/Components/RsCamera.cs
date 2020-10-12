@@ -33,6 +33,7 @@ using System.Threading;
 using System.Runtime.InteropServices;
 
 using RPointCloud = Rhino.Geometry.PointCloud; // Avoid conflict with Intel.RealSense.PointCloud and Rhino.Geometry.PointCloud
+using Rhino;
 
 namespace RsTools.GH.Components
 {
@@ -164,7 +165,16 @@ namespace RsTools.GH.Components
             cfg.EnableStream(Stream.Color, 1280, 720, Format.Rgb8);
 
             var pipeline = new Pipeline();
-            var pp = pipeline.Start(cfg);
+            PipelineProfile pp = null;
+            try
+            {
+                pp = pipeline.Start(cfg);
+            }
+            catch (Exception e)
+            {
+                RhinoApp.WriteLine("RsToolkit: " + e.Message);
+                return;
+            }
 
             while (m_is_on)
             {
