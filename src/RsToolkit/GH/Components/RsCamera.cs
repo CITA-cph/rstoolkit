@@ -34,6 +34,7 @@ using System.Runtime.InteropServices;
 
 using RPointCloud = Rhino.Geometry.PointCloud; // Avoid conflict with Intel.RealSense.PointCloud and Rhino.Geometry.PointCloud
 using Rhino;
+using System.Runtime.CompilerServices;
 
 namespace RsTools.GH.Components
 {
@@ -44,12 +45,14 @@ namespace RsTools.GH.Components
               "Get data from RealSense depth camera.",
               "RsTools", "Sense")
         {
+            //m_thread = new Thread(new ThreadStart(RunThread));
         }
 
         // ======== Thread stuff ========
 
-        private Thread          m_thread = null;
-        private volatile bool   m_is_on = false;
+        private bool   m_is_on = false;
+        Task m_task = null;
+        CancellationTokenSource token = new CancellationTokenSource();
 
         // ======== Rhino objects ========
 
@@ -140,7 +143,7 @@ namespace RsTools.GH.Components
             return colors;
         }
 
-        private void RunThread()
+        private void RunThread(CancellationToken token)
         {
             Intel.RealSense.PointCloud pc = new Intel.RealSense.PointCloud();
 
@@ -176,131 +179,148 @@ namespace RsTools.GH.Components
                 return;
             }
 
-            while (m_is_on)
+            while (!token.IsCancellationRequested)
             {
-                using (var frames = pipeline.WaitForFrames())
+                try
                 {
-                    var aligned = align_to_depth.Process<FrameSet>(frames).DisposeWith(frames);
-                    var color = aligned.ColorFrame.DisposeWith(frames);
-
-                    pc.MapTexture(color);
-
-                    var filtered = aligned[Stream.Depth].DisposeWith(frames);
-
-                    foreach (var filter in filters)
-                        filtered = filter.Process(filtered).DisposeWith(frames);
-
-                    Points points = pc.Process<Points>(filtered);
-
-                    var vertices = new Point3f[points.Count];
-                    var tex_coords = new Point2f[points.Count];
-
-                    points.CopyVertices<Point3f>(vertices);
-                    points.CopyTextureCoords<Point2f>(tex_coords);
-
-                    Debug.Assert(vertices.Length == tex_coords.Length);
-
-                    // ======== CULL INVALID POINTS ======== 
-
-                    if (true)
+                    using (var frames = pipeline.WaitForFrames())
                     {
+                        var aligned = align_to_depth.Process<FrameSet>(frames).DisposeWith(frames);
+                        var color = aligned.ColorFrame.DisposeWith(frames);
 
-                        var flags = new bool[vertices.Length];
-                        int new_size = 0;
-                        for (int i = 0; i < vertices.Length; ++i)
+                        pc.MapTexture(color);
+
+                        var filtered = aligned[Stream.Depth].DisposeWith(frames);
+
+                        foreach (var filter in filters)
+                            filtered = filter.Process(filtered).DisposeWith(frames);
+
+                        Points points = pc.Process<Points>(filtered);
+
+                        var vertices = new Point3f[points.Count];
+                        var tex_coords = new Point2f[points.Count];
+
+                        points.CopyVertices<Point3f>(vertices);
+                        points.CopyTextureCoords<Point2f>(tex_coords);
+
+                        Debug.Assert(vertices.Length == tex_coords.Length);
+
+                        // ======== CULL INVALID POINTS ======== 
+
+                        if (true)
                         {
-                            if (vertices[i].Z > 0.1)
+
+                            var flags = new bool[vertices.Length];
+                            int new_size = 0;
+                            for (int i = 0; i < vertices.Length; ++i)
                             {
-                                flags[i] = true;
-                                new_size++;
+                                if (vertices[i].Z > 0.1)
+                                {
+                                    flags[i] = true;
+                                    new_size++;
+                                }
                             }
+
+                            var new_vertices = new Point3f[new_size];
+                            var new_tex_coords = new Point2f[new_size];
+
+                            for (int i = 0, j = 0; i < vertices.Length; ++i)
+                            {
+                                if (flags[i])
+                                {
+                                    new_vertices[j] = vertices[i];
+                                    new_tex_coords[j] = tex_coords[i];
+                                    ++j;
+                                }
+                            }
+
+                            vertices = new_vertices;
+                            tex_coords = new_tex_coords;
                         }
 
-                        var new_vertices = new Point3f[new_size];
-                        var new_tex_coords = new Point2f[new_size];
+                        // ======== TRANSFORM ======== 
 
-                        for (int i = 0, j = 0; i < vertices.Length; ++i)
+                        if (m_xform.IsValid)
                         {
-                            if (flags[i])
+                            Parallel.For(0, vertices.Length - 1, (i) =>
                             {
-                                new_vertices[j] = vertices[i];
-                                new_tex_coords[j] = tex_coords[i];
-                                ++j;
-                            }
+                                vertices[i].Transform(m_xform);
+                            });
                         }
 
-                        vertices = new_vertices;
-                        tex_coords = new_tex_coords;
+                        // ======== CLIP TO BOX ======== 
+
+                        if (m_clipping_box.IsValid &&
+                            m_clipping_box.X.Length > 0 &&
+                            m_clipping_box.Y.Length > 0 &&
+                            m_clipping_box.Z.Length > 0)
+                        {
+                            Point3d box_centre = m_clipping_box.Plane.Origin;
+                            double minx = m_clipping_box.X.Min + box_centre.X, maxx = m_clipping_box.X.Max + box_centre.X;
+                            double miny = m_clipping_box.Y.Min + box_centre.Y, maxy = m_clipping_box.Y.Max + box_centre.Y;
+                            double minz = m_clipping_box.Z.Min + box_centre.Z, maxz = m_clipping_box.Z.Max + box_centre.Z;
+
+                            var flags = new bool[vertices.Length];
+                            int new_size = 0;
+                            for (int i = 0; i < vertices.Length; ++i)
+                            {
+                                if (
+                                    vertices[i].X < maxx && vertices[i].X > minx &&
+                                    vertices[i].Y < maxy && vertices[i].Y > miny &&
+                                    vertices[i].Z < maxz && vertices[i].Z > minz
+                                    )
+                                {
+                                    flags[i] = true;
+                                    new_size++;
+                                }
+                            }
+
+                            var new_vertices = new Point3f[new_size];
+                            var new_tex_coords = new Point2f[new_size];
+
+                            for (int i = 0, j = 0; i < vertices.Length; ++i)
+                            {
+                                if (flags[i])
+                                {
+                                    new_vertices[j] = vertices[i];
+                                    new_tex_coords[j] = tex_coords[i];
+                                    ++j;
+                                }
+                            }
+
+                            vertices = new_vertices;
+                            tex_coords = new_tex_coords;
+                        }
+
+                        Debug.Assert(vertices.Length == tex_coords.Length);
+
+                        var point_colors = GetPointColors(color, tex_coords);
+
+                        RPointCloud new_pointcloud = new RPointCloud();
+                        new_pointcloud.AddRange(vertices.Select(x => new Point3d(x)), point_colors);
+
+                        lock (m_pointcloud)
+                            m_pointcloud = new_pointcloud;
                     }
-
-                    // ======== TRANSFORM ======== 
-
-                    if (m_xform.IsValid)
-                    {
-                        Parallel.For(0, vertices.Length - 1, (i) =>
-                        {
-                            vertices[i].Transform(m_xform);
-                        });
-                    }
-                    
-                    // ======== CLIP TO BOX ======== 
-
-                    if (m_clipping_box.IsValid &&
-                        m_clipping_box.X.Length > 0 &&
-                        m_clipping_box.Y.Length > 0 &&
-                        m_clipping_box.Z.Length > 0)
-                    {
-                        Point3d box_centre = m_clipping_box.Plane.Origin;
-                        double minx = m_clipping_box.X.Min + box_centre.X, maxx = m_clipping_box.X.Max + box_centre.X;
-                        double miny = m_clipping_box.Y.Min + box_centre.Y, maxy = m_clipping_box.Y.Max + box_centre.Y;
-                        double minz = m_clipping_box.Z.Min + box_centre.Z, maxz = m_clipping_box.Z.Max + box_centre.Z;
-
-                        var flags = new bool[vertices.Length];
-                        int new_size = 0;
-                        for (int i = 0; i < vertices.Length; ++i)
-                        {
-                            if (
-                                vertices[i].X < maxx && vertices[i].X > minx &&
-                                vertices[i].Y < maxy && vertices[i].Y > miny &&
-                                vertices[i].Z < maxz && vertices[i].Z > minz
-                                )
-                            {
-                                flags[i] = true;
-                                new_size++;
-                            }
-                        }
-
-                        var new_vertices = new Point3f[new_size];
-                        var new_tex_coords = new Point2f[new_size];
-
-                        for (int i = 0, j = 0; i < vertices.Length; ++i)
-                        {
-                            if (flags[i])
-                            {
-                                new_vertices[j] = vertices[i];
-                                new_tex_coords[j] = tex_coords[i];
-                                ++j;
-                            }
-                        }
-                        
-                        vertices = new_vertices;
-                        tex_coords = new_tex_coords;
-                    }
-
-                    Debug.Assert(vertices.Length == tex_coords.Length);
-                    
-                    var point_colors = GetPointColors(color, tex_coords);
-
-                    RPointCloud new_pointcloud = new RPointCloud();
-                    new_pointcloud.AddRange(vertices.Select(x => new Point3d(x)), point_colors);
-
-                    lock (m_pointcloud)
-                        m_pointcloud = new_pointcloud;
+                }
+                catch (Exception e)
+                {
+                    RhinoApp.WriteLine("RsToolkit: " + e.Message);
+                    m_is_on = false;
+                    break;
                 }
             }
 
+            RhinoApp.WriteLine("RsToolkit: Task cancelled.");
+
             if (pipeline != null)
                 pipeline.Stop();
+        }
+
+        public override void RemovedFromDocument(GH_Document document)
+        {
+            token.Cancel();
+            base.RemovedFromDocument(document);
         }
 
         private bool CheckFiltersChanged(IGH_DataAccess DA)
@@ -356,28 +376,39 @@ namespace RsTools.GH.Components
 
         protected override void SolveInstance(IGH_DataAccess DA)
         {
-            //if (_thread != null && _thread.IsAlive && filters_changed)
-            //{
-            //    IsOn = false;
-            //    _thread.Join();
-            //}
-
             DA.GetData("ON", ref m_is_on);
+
             DA.GetData("Transform", ref m_xform);
             DA.GetData("Clipping Box", ref m_clipping_box);
 
-            if (m_thread == null || !m_thread.IsAlive)
-                m_thread = new Thread(new ThreadStart(RunThread));
 
-            if (m_is_on && m_thread.ThreadState == System.Threading.ThreadState.Unstarted)
+            // If task is already running, see if we need to cancel it
+            if ((m_task != null) && (m_task.IsCompleted == false ||
+                                   m_task.Status == TaskStatus.Running ||
+                                   m_task.Status == TaskStatus.WaitingToRun ||
+                                   m_task.Status == TaskStatus.WaitingForActivation))
             {
-                bool filters_changed = CheckFiltersChanged(DA);
-                m_thread.Start();
+                if (!m_is_on)
+                    token.Cancel();
             }
-            else if (!m_is_on)
+            // Else if the task is not running, see if we need to start it
+            else
             {
-                if (m_thread != null && m_thread.IsAlive)
-                    m_thread.Join();
+                if (m_is_on)
+                {
+                    if (token != null) token.Cancel();
+                    token = new CancellationTokenSource();
+                    bool filters_changed = CheckFiltersChanged(DA);
+
+                    m_task = Task.Factory.StartNew(() =>
+                    {
+                        RunThread(token.Token);
+                    },
+                    token.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+                    RhinoApp.WriteLine("RsToolkit: Task started.");
+
+                }
             }
 
             lock (m_pointcloud)
